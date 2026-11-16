@@ -2,9 +2,7 @@
 
 > **A senior engineer's field guide to architecture, state, modules, security, CI/CD, operations, and interviews**
 >
-> **Repository:** https://github.com/SushmitaDalai/terraform-module-eks-example  
-> **Status:** technical learning/reference implementation; not evidence of a successful production deployment.  
-> **Evidence standard:** **Observed** means visible in the supplied code/screenshots or public repository landing page; **Proposed** is a recommended extension; **Verify** means check the linked file or your AWS/GitHub/Jenkins configuration before relying on it.
+
 
 ## Contents
 
@@ -29,10 +27,6 @@
 This repository illustrates how an engineer can use a **single Terraform root module** with distinct configuration and state for `dev`, `stg`, and `prod` AWS accounts, while consuming a separately versioned EKS module. It is designed to demonstrate *why* separation and security boundaries matter, not merely how to type `terraform apply`.
 
 **Audience:** DevOps/cloud engineers, senior engineers, platform engineers, technical reviewers, and interview candidates. The narrative deliberately distinguishes observed code from recommended production hardening.
-
-**What was checked for this document:** The public repository landing page and supplied screenshots, the earlier Task 1 source ZIP, the screenshot of the final VS Code layout, and the locally supplied GitHub Actions workflow files. **Important:** The Task 1 ZIP predates the final `iac/eks` restructuring, so the **final layout in the screenshot takes precedence**. The public GitHub listing confirmed the repository exists; individual nested files and Jenkins files were not all retrievable. Do not assume that an example command or recommended policy has already been deployed.
-
-**Project-specific values you must fill in:** `[ORG]`, `[ACCOUNT_DEV]`, `[ACCOUNT_STG]`, `[ACCOUNT_PROD]`, `[REGION]`, `[VPC_ID]`, `[PRIVATE_SUBNET_IDS]`, `[STATE_BUCKET]`, `[KMS_KEY_ARN]`, `[GITHUB_REVIEWERS]`, `[JENKINS_BASE_ROLE]`, `[REAL_MODULE_REPO]`. Placeholder AWS account IDs such as `111111111111` are **not** real account data.
 
 ### Core model
 
