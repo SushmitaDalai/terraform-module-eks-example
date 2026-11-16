@@ -1,0 +1,124 @@
+# Reusable Terraform deployment workflow for infrastructure-live/iac/eks.
+# Called by pipeline.yml for dev, stg or prod. Production approval is configured
+# using required reviewers on the GitHub "prod" Environment.
+name: Terraform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Terraform environment: dev, stg or prod"
+        required: true
+        type: string
+      role_arn:
+        description: "AWS IAM role assumed through GitHub OIDC"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region for this deployment"
+        required: true
+        type: string
+      component:
+        description: "Terraform root module directory under iac/"
+        required: false
+        default: eks
+        type: string
+      apply:
+        description: "Apply the saved plan (false = plan only)"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      MODULES_REPO_TOKEN:
+        description: "Read-only token for the private terraform-modules repo"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  terraform:
+    name: ${{ inputs.environment }} / ${{ inputs.component }} / Terraform
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # Do not cancel a deployment that may hold the Terraform state lock.
+    concurrency:
+      group: terraform-${{ inputs.environment }}-${{ inputs.component }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: iac/${{ inputs.component }}
+        shell: bash
+
+    steps:
+      # Check out the infrastructure-live repository.
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Check inputs before referencing repository directories or AWS roles.
+      - name: Verify environment and component
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+          TF_COMPONENT: ${{ inputs.component }}
+        run: |
+          case "$TF_ENVIRONMENT" in dev|stg|prod) ;; *) echo 'Unsupported environment'; exit 1 ;; esac
+          case "$TF_COMPONENT" in eks) ;; *) echo 'Unsupported component'; exit 1 ;; esac
+          test -f "../../config/$TF_ENVIRONMENT/backend.hcl"
+          test -f "../../config/$TF_ENVIRONMENT/$TF_ENVIRONMENT.tfvars"
+
+      # Install one pinned Terraform CLI version.
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.11.4'
+          terraform_wrapper: false
+
+      # Exchange GitHub's OIDC identity token for temporary credentials.
+      - name: Assume AWS deployment role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-terraform-${{ github.run_id }}
+
+      # Temporarily authenticate Git so Terraform can download the private module.
+      # The token is not echoed and the rewrite rule is removed after init.
+      - name: Initialize Terraform with the environment's S3 backend
+        env:
+          MODULES_REPO_TOKEN: ${{ secrets.MODULES_REPO_TOKEN }}
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+          TF_IN_AUTOMATION: 'true'
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_GLOBAL="$RUNNER_TEMP/terraform-gitconfig"
+          trap 'rm -f "$GIT_CONFIG_GLOBAL"' EXIT
+          git config --global url."https://x-access-token:${MODULES_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          terraform init -reconfigure -input=false \
+            -backend-config="../../config/${TF_ENVIRONMENT}/backend.hcl"
+
+      # Format and validate the Terraform root module.
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+      - name: Validate Terraform
+        run: terraform validate -no-color
+
+      # Save a binary plan so apply uses the exact changes that were planned.
+      - name: Plan Terraform changes
+        env:
+          TF_ENVIRONMENT: ${{ inputs.environment }}
+          TF_IN_AUTOMATION: 'true'
+        run: |
+          terraform plan -input=false -no-color \
+            -var-file="../../config/${TF_ENVIRONMENT}/${TF_ENVIRONMENT}.tfvars" \
+            -out=tfplan
+
+      # On pull requests apply=false; only a main-branch caller may apply.
+      - name: Apply Terraform plan
+        if: ${{ inputs.apply && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          TF_IN_AUTOMATION: 'true'
+        run: terraform apply -input=false -no-color tfplan
