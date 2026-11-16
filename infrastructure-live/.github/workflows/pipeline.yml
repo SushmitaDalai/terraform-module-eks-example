@@ -1,0 +1,214 @@
+# Main CI/CD pipeline for infrastructure-live.
+# Terraform root: iac/eks; environment settings: config/{dev,stg,prod}/.
+name: Terraform Infrastructure Pipeline
+
+on:
+  pull_request:
+    paths:
+      - 'iac/**'
+      - 'config/**'
+      - '.github/workflows/**'
+      - 'Jenkinsfile'
+      - 'jenkins/**'
+  push:
+    branches: [main]
+    paths:
+      - 'iac/**'
+      - 'config/**'
+      - '.github/workflows/**'
+      - 'Jenkinsfile'
+      - 'jenkins/**'
+
+# The deploy workflow grants id-token:write only in its deployment job.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: Detect affected environments
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.detect.outputs.shared }}
+      dev: ${{ steps.detect.outputs.dev }}
+      stg: ${{ steps.detect.outputs.stg }}
+      prod: ${{ steps.detect.outputs.prod }}
+    steps:
+      # Fetch commit history for accurate PR and push comparisons, including squash merges.
+      - name: Checkout repository and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Shared Terraform changes affect all environments; environment configs affect only their own.
+      # Pipeline-only edits run checks but do not trigger deployments.
+      - name: Determine changed paths
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == 'pull_request' ]]; then
+            # Compare the PR head against its merge base with the destination branch.
+            git fetch --no-tags origin "$BASE_SHA"
+            BASE=$(git merge-base "$BASE_SHA" HEAD)
+          else
+            BASE="$BASE_SHA"
+          fi
+
+          # A first push (zero SHA) or missing comparison history conservatively deploys all.
+          if [[ "$BASE" =~ ^0+$ ]] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo 'Unable to identify a reliable base commit; treating all environments as changed.'
+            SHARED=true
+            DEV=true
+            STG=true
+            PROD=true
+          else
+            CHANGED=$(git diff --name-only "$BASE" HEAD)
+            printf 'Changed files:\n%s\n' "$CHANGED"
+            SHARED=false
+            DEV=false
+            STG=false
+            PROD=false
+            if grep -Eq '^(iac/|config/common\.tfvars$)' <<< "$CHANGED"; then
+              SHARED=true
+              DEV=true
+              STG=true
+              PROD=true
+            else
+              if grep -Eq '^config/dev/' <<< "$CHANGED"; then DEV=true; fi
+              if grep -Eq '^config/stg/' <<< "$CHANGED"; then STG=true; fi
+              if grep -Eq '^config/prod/' <<< "$CHANGED"; then PROD=true; fi
+            fi
+          fi
+          {
+            echo "shared=$SHARED"
+            echo "dev=$DEV"
+            echo "stg=$STG"
+            echo "prod=$PROD"
+          } >> "$GITHUB_OUTPUT"
+
+  format:
+    name: Terraform format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.11.4'
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+  validate:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: iac/eks
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.11.4'
+      # No AWS state is accessed during validation, but the private Git module must be downloaded.
+      - name: Initialize modules without the remote backend, then validate
+        shell: bash
+        env:
+          MODULES_REPO_TOKEN: ${{ secrets.MODULES_REPO_TOKEN }}
+          TF_IN_AUTOMATION: 'true'
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_GLOBAL="$RUNNER_TEMP/terraform-gitconfig"
+          trap 'rm -f "$GIT_CONFIG_GLOBAL"' EXIT
+          git config --global url."https://x-access-token:${MODULES_REPO_TOKEN}@github.com/".insteadOf 'https://github.com/'
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
+  security:
+    name: Checkov security scan (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Checkov findings are reported but never block this pipeline by design.
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: iac/eks
+          framework: terraform
+          soft_fail: true
+          quiet: true
+
+  # A PR only previews dev. A push to main applies dev when affected.
+  # Every deployment invokes the same reusable workflow to keep the commands consistent.
+  deploy-dev:
+    name: Dev / plan or apply
+    needs: [changes, format, validate, security]
+    if: ${{ needs.changes.outputs.dev == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: dev
+      role_arn: arn:aws:iam::111111111111:role/terraform-deploy
+      aws_region: us-east-1
+      component: eks
+      apply: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets: inherit
+
+  # A skipped dev job is acceptable only when dev did not change.
+  # always() prevents GitHub from automatically skipping this job due to a skipped dependency.
+  deploy-stg:
+    name: Staging / apply
+    needs: [changes, format, validate, security, deploy-dev]
+    if: >-
+      ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          needs.changes.result == 'success' && needs.format.result == 'success' &&
+          needs.validate.result == 'success' && needs.security.result == 'success' &&
+          needs.changes.outputs.stg == 'true' &&
+          (needs.deploy-dev.result == 'success' ||
+           (needs.deploy-dev.result == 'skipped' && needs.changes.outputs.dev != 'true')) }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: stg
+      role_arn: arn:aws:iam::222222222222:role/terraform-deploy
+      aws_region: us-east-1
+      component: eks
+      apply: true
+    secrets: inherit
+
+  # Production starts after all required earlier deployments succeed.
+  # Configure required reviewers on the GitHub Environment named 'prod'.
+  # Approval is before the prod plan, because plan and apply are in one reusable job.
+  deploy-prod:
+    name: Production / approved apply
+    needs: [changes, format, validate, security, deploy-dev, deploy-stg]
+    if: >-
+      ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          needs.changes.result == 'success' && needs.format.result == 'success' &&
+          needs.validate.result == 'success' && needs.security.result == 'success' &&
+          needs.changes.outputs.prod == 'true' &&
+          (needs.deploy-dev.result == 'success' ||
+           (needs.deploy-dev.result == 'skipped' && needs.changes.outputs.dev != 'true')) &&
+          (needs.deploy-stg.result == 'success' ||
+           (needs.deploy-stg.result == 'skipped' && needs.changes.outputs.stg != 'true')) }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: prod
+      role_arn: arn:aws:iam::333333333333:role/terraform-deploy
+      aws_region: us-east-1
+      component: eks
+      apply: true
+    secrets: inherit
